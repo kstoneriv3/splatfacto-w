@@ -84,8 +84,8 @@ class SplatfactoWDatamanagerConfig(DataManagerConfig):
     new images. If -1, never pick new images."""
     eval_image_indices: Optional[Tuple[int, ...]] = (0,)
     """Specifies the image indices to use during eval; if None, uses all."""
-    cache_images: Literal["cpu", "gpu"] = "cpu"
-    """Whether to cache images in memory. If "cpu", caches on cpu. If "gpu", caches on device."""
+    cache_images: Literal["cpu", "gpu", "disk"] = "cpu"
+    """Whether to cache images in memory. If "disk", loads on demand from disk."""
     cache_images_type: Literal["uint8", "float32"] = "float32"
     """The image type returned from manager, caching images in uint8 saves memory"""
     max_thread_workers: Optional[int] = None
@@ -159,19 +159,49 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
     def cached_train(self) -> List[Dict[str, torch.Tensor]]:
         """Get the training images. Will load and undistort the images the
         first time this (cached) property is accessed."""
+        if self.config.cache_images == "disk":
+            return []
         return self._load_images("train", cache_images_device=self.config.cache_images)
 
     @cached_property
     def cached_eval(self) -> List[Dict[str, torch.Tensor]]:
         """Get the eval images. Will load and undistort the images the
         first time this (cached) property is accessed."""
+        if self.config.cache_images == "disk":
+            return []
         return self._load_images("eval", cache_images_device=self.config.cache_images)
+
+    def _load_and_undistort_image(
+        self, dataset: TDataset, idx: int
+    ) -> Dict[str, torch.Tensor]:
+        data = dataset.get_data(idx, image_type=self.config.cache_images_type)
+        camera = dataset.cameras[idx].reshape(())
+        if camera.distortion_params is None or torch.all(camera.distortion_params == 0):
+            return data
+        K = camera.get_intrinsics_matrices().numpy()
+        distortion_params = camera.distortion_params.numpy()
+        image = data["image"].numpy()
+
+        K, image, mask = _undistort_image(camera, distortion_params, data, image, K)
+        data["image"] = torch.from_numpy(image)
+        if mask is not None:
+            data["mask"] = mask
+
+        dataset.cameras.fx[idx] = float(K[0, 0])
+        dataset.cameras.fy[idx] = float(K[1, 1])
+        dataset.cameras.cx[idx] = float(K[0, 2])
+        dataset.cameras.cy[idx] = float(K[1, 2])
+        dataset.cameras.width[idx] = image.shape[1]
+        dataset.cameras.height[idx] = image.shape[0]
+        return data
 
     def _load_images(
         self,
         split: Literal["train", "eval"],
-        cache_images_device: Literal["cpu", "gpu"],
+        cache_images_device: Literal["cpu", "gpu", "disk"],
     ) -> List[Dict[str, torch.Tensor]]:
+        if cache_images_device == "disk":
+            return []
         undistorted_images: List[Dict[str, torch.Tensor]] = []
 
         # Which dataset?
@@ -182,40 +212,12 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
         else:
             assert_never(split)
 
-        def undistort_idx(idx: int) -> Dict[str, torch.Tensor]:
-            data = dataset.get_data(idx, image_type=self.config.cache_images_type)
-            camera = dataset.cameras[idx].reshape(())
-            # assert data["image"].shape[1] == camera.width.item() and data["image"].shape[0] == camera.height.item(), (
-            #     f'The size of image ({data["image"].shape[1]}, {data["image"].shape[0]}) loaded '
-            #     f'does not match the camera parameters ({camera.width.item(), camera.height.item()})'
-            # )
-            if camera.distortion_params is None or torch.all(
-                camera.distortion_params == 0
-            ):
-                return data
-            K = camera.get_intrinsics_matrices().numpy()
-            distortion_params = camera.distortion_params.numpy()
-            image = data["image"].numpy()
-
-            K, image, mask = _undistort_image(camera, distortion_params, data, image, K)
-            data["image"] = torch.from_numpy(image)
-            if mask is not None:
-                data["mask"] = mask
-
-            dataset.cameras.fx[idx] = float(K[0, 0])
-            dataset.cameras.fy[idx] = float(K[1, 1])
-            dataset.cameras.cx[idx] = float(K[0, 2])
-            dataset.cameras.cy[idx] = float(K[1, 2])
-            dataset.cameras.width[idx] = image.shape[1]
-            dataset.cameras.height[idx] = image.shape[0]
-            return data
-
         CONSOLE.log(f"Caching / undistorting {split} images")
         with ThreadPoolExecutor(max_workers=2) as executor:
             undistorted_images = list(
                 track(
                     executor.map(
-                        undistort_idx,
+                        lambda idx: self._load_and_undistort_image(dataset, idx),
                         range(len(dataset)),
                     ),
                     description=f"Caching / undistorting {split} images",
@@ -235,6 +237,8 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
                 cache["image"] = cache["image"].pin_memory()
                 if "mask" in cache:
                     cache["mask"] = cache["mask"].pin_memory()
+        elif cache_images_device == "disk":
+            pass
         else:
             assert_never(cache_images_device)
 
@@ -296,7 +300,13 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
         Pretends to be the dataloader for evaluation, it returns a list of (camera, data) tuples
         """
         image_indices = [i for i in range(len(self.eval_dataset))]
-        data = deepcopy(self.cached_eval)
+        if self.config.cache_images == "disk":
+            data = [
+                self._load_and_undistort_image(self.eval_dataset, idx)
+                for idx in image_indices
+            ]
+        else:
+            data = deepcopy(self.cached_eval)
         _cameras = deepcopy(self.eval_dataset.cameras).to(self.device)
         cameras = []
         for i in image_indices:
@@ -330,8 +340,13 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
         if len(self.train_unseen_cameras) == 0:
             self.train_unseen_cameras = [i for i in range(len(self.train_dataset))]
 
-        data = deepcopy(self.cached_train[image_idx])
+        if self.config.cache_images == "disk":
+            data = self._load_and_undistort_image(self.train_dataset, image_idx)
+        else:
+            data = deepcopy(self.cached_train[image_idx])
         data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
 
         assert (
             len(self.train_dataset.cameras.shape) == 1
@@ -377,8 +392,13 @@ class SplatfactoWDatamanager(DataManager, Generic[TDataset]):
         if len(self.eval_unseen_cameras) == 0:
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
 
-        data = deepcopy(self.cached_eval[image_idx])
+        if self.config.cache_images == "disk":
+            data = self._load_and_undistort_image(self.eval_dataset, image_idx)
+        else:
+            data = deepcopy(self.cached_eval[image_idx])
         data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
         assert (
             len(self.eval_dataset.cameras.shape) == 1
         ), "Assumes single batch dimension"

@@ -13,9 +13,6 @@ from splatfactow.splatfactow_model import SplatfactoWModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from splatfactow.nerfw_dataparser import NerfWDataParserConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
-from nerfstudio.data.datamanagers.full_images_datamanager import (
-    FullImageDatamanagerConfig,
-)
 from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import (
@@ -134,10 +131,8 @@ splatfactow_light_config = MethodSpecification(
         max_num_iterations=30000,
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
-            datamanager=FullImageDatamanagerConfig(
-                dataparser=NerfstudioDataParserConfig(
-                    load_3D_points=True,
-                ),
+            datamanager=SplatfactoWDatamanagerConfig(
+                dataparser=NerfstudioDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
             ),
             model=SplatfactoWModelConfig(
