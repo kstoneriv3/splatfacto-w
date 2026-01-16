@@ -193,6 +193,8 @@ class SplatfactoWModelConfig(ModelConfig):
     """weight of ssim loss"""
     stop_split_at: int = 20000
     """stop splitting at this step"""
+    save_only_on_refinement: bool = False
+    """If True, only save checkpoints right after densification/culling (plus final save)."""
     use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
     max_gauss_ratio: float = 10.0
@@ -589,7 +591,7 @@ class SplatfactoWModel(Model):
         assert background_color.shape == (3,)
         self.background_color = background_color
 
-    def refinement_after(self, optimizers: Optimizers, step):
+    def refinement_after(self, optimizers: Optimizers, trainer, step):
         assert step == self.step
         if self.step <= self.config.warmup_length:
             return
@@ -604,7 +606,12 @@ class SplatfactoWModel(Model):
                 and self.step % reset_interval
                 > self.num_train_data + self.config.refine_every
             )
+            did_refine = False
             if do_densification:
+                densify_start_points = self.num_points
+                CONSOLE.log(
+                    f"Densification start: {densify_start_points} gaussians"
+                )
                 # then we densify
                 assert (
                     self.xys_grad_norm is not None
@@ -658,6 +665,11 @@ class SplatfactoWModel(Model):
                 dup_idcs = torch.where(dups)[0]
                 self.dup_in_all_optim(optimizers, dup_idcs, 1)
 
+                densify_after_points = self.num_points
+                CONSOLE.log(
+                    f"Densification done (pre-cull): {densify_after_points} gaussians"
+                )
+
                 # After a guassian is split into two new gaussians, the original one should also be pruned.
                 splits_mask = torch.cat(
                     (
@@ -670,18 +682,37 @@ class SplatfactoWModel(Model):
                     )
                 )
 
+                cull_start_points = self.num_points
+                CONSOLE.log(
+                    f"Culling start: {cull_start_points} gaussians"
+                )
                 deleted_mask = self.cull_gaussians(splits_mask)
+                CONSOLE.log(
+                    f"Culling done: {cull_start_points} -> {self.num_points} gaussians"
+                )
+                did_refine = True
             elif (
                 self.step >= self.config.stop_split_at
                 and self.config.continue_cull_post_densification
             ):
+                cull_start_points = self.num_points
+                CONSOLE.log(
+                    f"Culling start: {cull_start_points} gaussians"
+                )
                 deleted_mask = self.cull_gaussians()
+                CONSOLE.log(
+                    f"Culling done: {cull_start_points} -> {self.num_points} gaussians"
+                )
+                did_refine = True
             else:
                 # if we donot allow culling post refinement, no more gaussians will be pruned.
                 deleted_mask = None
 
             if deleted_mask is not None:
                 self.remove_from_all_optim(optimizers, deleted_mask)
+
+            if did_refine and self.config.save_only_on_refinement and trainer is not None:
+                trainer.save_checkpoint(self.step)
 
             if (
                 self.step < self.config.stop_split_at
@@ -810,6 +841,11 @@ class SplatfactoWModel(Model):
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
         cbs = []
+        if (
+            self.config.save_only_on_refinement
+            and training_callback_attributes.trainer is not None
+        ):
+            training_callback_attributes.trainer.config.steps_per_save = 0
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
@@ -827,7 +863,10 @@ class SplatfactoWModel(Model):
                 [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
                 self.refinement_after,
                 update_every_num_iters=self.config.refine_every,
-                args=[training_callback_attributes.optimizers],
+                args=[
+                    training_callback_attributes.optimizers,
+                    training_callback_attributes.trainer,
+                ],
             )
         )
         return cbs
