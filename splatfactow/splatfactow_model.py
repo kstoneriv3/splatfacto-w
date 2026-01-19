@@ -171,6 +171,8 @@ class SplatfactoWModelConfig(ModelConfig):
     """If True, continue to cull gaussians post refinement"""
     reset_alpha_every: int = 25
     """Every this many refinement steps, reset the alpha"""
+    densify_and_cull_every: int = 2500
+    """Number of steps between densification/culling cycles."""
     densify_grad_thresh: float = 0.0008
     """threshold of positional gradient norm for densifying gaussians"""
     densify_size_thresh: float = 0.01
@@ -600,7 +602,7 @@ class SplatfactoWModel(Model):
             # save checkpoints right when the opacity is reset (saves every 2k)
             # then cull
             # only split/cull if we've seen every image since opacity reset
-            reset_interval = self.config.reset_alpha_every * self.config.refine_every
+            reset_interval = self.config.densify_and_cull_every
             do_densification = (
                 self.step < self.config.stop_split_at
                 and self.step % reset_interval
