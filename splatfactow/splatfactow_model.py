@@ -197,6 +197,8 @@ class SplatfactoWModelConfig(ModelConfig):
     """stop splitting at this step"""
     save_only_on_refinement: bool = False
     """If True, only save checkpoints right after densification/culling (plus final save)."""
+    peak_mem_estimate_factor: float = 2.0
+    """Multiplier on per-splat parameter memory to estimate peak GPU usage."""
     use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
     max_gauss_ratio: float = 10.0
@@ -593,6 +595,23 @@ class SplatfactoWModel(Model):
         assert background_color.shape == (3,)
         self.background_color = background_color
 
+    def _estimate_peak_bytes(self, num_points: int) -> Optional[float]:
+        if not torch.cuda.is_available() or self.device.type != "cuda":
+            return None
+        if num_points <= 0 or self.num_points <= 0:
+            return None
+        bytes_per_splat = 0.0
+        for param in self.gauss_params.values():
+            bytes_per_splat += (param.numel() * param.element_size()) / self.num_points
+        return self.config.peak_mem_estimate_factor * bytes_per_splat * num_points
+
+    def _exceeds_peak_memory(self, num_points: int) -> bool:
+        est_bytes = self._estimate_peak_bytes(num_points)
+        if est_bytes is None:
+            return False
+        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        return est_bytes > total_bytes
+
     def refinement_after(self, optimizers: Optimizers, trainer, step):
         assert step == self.step
         if self.step <= self.config.warmup_length:
@@ -601,12 +620,10 @@ class SplatfactoWModel(Model):
             # Offset all the opacity reset logic by refine_every so that we don't
             # save checkpoints right when the opacity is reset (saves every 2k)
             # then cull
-            # only split/cull if we've seen every image since opacity reset
             reset_interval = self.config.densify_and_cull_every
             do_densification = (
                 self.step < self.config.stop_split_at
-                and self.step % reset_interval
-                > self.num_train_data + self.config.refine_every
+                and self.step % reset_interval == 0
             )
             did_refine = False
             if do_densification:
@@ -636,63 +653,76 @@ class SplatfactoWModel(Model):
                     ).squeeze()
                 splits &= high_grads
                 nsamps = self.config.n_split_samples
-                split_params = self.split_gaussians(splits, nsamps)
-
                 dups = (
                     self.scales.exp().max(dim=-1).values
                     <= self.config.densify_size_thresh
                 ).squeeze()
                 dups &= high_grads
-                dup_params = self.dup_gaussians(dups)
-                for name, param in self.gauss_params.items():
-                    self.gauss_params[name] = torch.nn.Parameter(
-                        torch.cat(
-                            [param.detach(), split_params[name], dup_params[name]],
-                            dim=0,
+                predicted_points = (
+                    self.num_points
+                    + int(splits.sum().item()) * nsamps
+                    + int(dups.sum().item())
+                )
+                skip_densify = self._exceeds_peak_memory(predicted_points)
+                if skip_densify:
+                    CONSOLE.log(
+                        "Skipping densification: estimated peak GPU memory would be exceeded."
+                    )
+                else:
+                    split_params = self.split_gaussians(splits, nsamps)
+                    dup_params = self.dup_gaussians(dups)
+                    for name, param in self.gauss_params.items():
+                        self.gauss_params[name] = torch.nn.Parameter(
+                            torch.cat(
+                                [param.detach(), split_params[name], dup_params[name]],
+                                dim=0,
+                            )
+                        )
+                    # append zeros to the max_2Dsize tensor
+                    self.max_2Dsize = torch.cat(
+                        [
+                            self.max_2Dsize,
+                            torch.zeros_like(split_params["scales"][:, 0]),
+                            torch.zeros_like(dup_params["scales"][:, 0]),
+                        ],
+                        dim=0,
+                    )
+
+                    split_idcs = torch.where(splits)[0]
+                    self.dup_in_all_optim(optimizers, split_idcs, nsamps)
+
+                    dup_idcs = torch.where(dups)[0]
+                    self.dup_in_all_optim(optimizers, dup_idcs, 1)
+
+                    densify_after_points = self.num_points
+                    CONSOLE.log(
+                        f"Densification done (pre-cull): {densify_after_points} gaussians"
+                    )
+
+                if not skip_densify:
+                    # After a guassian is split into two new gaussians, the original one should also be pruned.
+                    splits_mask = torch.cat(
+                        (
+                            splits,
+                            torch.zeros(
+                                nsamps * splits.sum() + dups.sum(),
+                                device=self.device,
+                                dtype=torch.bool,
+                            ),
                         )
                     )
-                # append zeros to the max_2Dsize tensor
-                self.max_2Dsize = torch.cat(
-                    [
-                        self.max_2Dsize,
-                        torch.zeros_like(split_params["scales"][:, 0]),
-                        torch.zeros_like(dup_params["scales"][:, 0]),
-                    ],
-                    dim=0,
-                )
 
-                split_idcs = torch.where(splits)[0]
-                self.dup_in_all_optim(optimizers, split_idcs, nsamps)
-
-                dup_idcs = torch.where(dups)[0]
-                self.dup_in_all_optim(optimizers, dup_idcs, 1)
-
-                densify_after_points = self.num_points
-                CONSOLE.log(
-                    f"Densification done (pre-cull): {densify_after_points} gaussians"
-                )
-
-                # After a guassian is split into two new gaussians, the original one should also be pruned.
-                splits_mask = torch.cat(
-                    (
-                        splits,
-                        torch.zeros(
-                            nsamps * splits.sum() + dups.sum(),
-                            device=self.device,
-                            dtype=torch.bool,
-                        ),
+                    cull_start_points = self.num_points
+                    CONSOLE.log(
+                        f"Culling start: {cull_start_points} gaussians"
                     )
-                )
-
-                cull_start_points = self.num_points
-                CONSOLE.log(
-                    f"Culling start: {cull_start_points} gaussians"
-                )
-                deleted_mask = self.cull_gaussians(splits_mask)
-                CONSOLE.log(
-                    f"Culling done: {cull_start_points} -> {self.num_points} gaussians"
-                )
-                did_refine = True
+                    deleted_mask = self.cull_gaussians(splits_mask)
+                    CONSOLE.log(
+                        f"Culling done: {cull_start_points} -> {self.num_points} gaussians"
+                    )
+                    did_refine = True
+                else:
+                    deleted_mask = None
             elif (
                 self.step >= self.config.stop_split_at
                 and self.config.continue_cull_post_densification
